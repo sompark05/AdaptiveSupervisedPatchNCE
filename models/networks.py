@@ -279,6 +279,9 @@ def define_F(input_nc, netF, norm='batch', use_dropout=False, init_type='normal'
         raise NotImplementedError('projection model name [%s] is not recognized' % netF)
     return init_net(net, init_type, init_gain, gpu_ids)
 
+def define_SimSiam(input_dim, hidden_dim=512, out_dim=256, pred_dim=128, init_type='normal', init_gain=0.02, gpu_ids=[]):
+    net = SimSiam(input_dim, hidden_dim=hidden_dim, out_dim=out_dim, pred_dim=pred_dim)
+    return init_net(net, init_type, init_gain, gpu_ids)
 
 def define_D(input_nc, ndf, netD, n_layers_D=3, norm='batch', init_type='normal', init_gain=0.02, no_antialias=False, gpu_ids=[], opt=None):
     """Create a discriminator
@@ -328,6 +331,32 @@ def define_D(input_nc, ndf, netD, n_layers_D=3, norm='batch', init_type='normal'
 ##############################################################################
 # Classes
 ##############################################################################
+class SimSiam(nn.Module):
+    def __init__(self, input_dim, hidden_dim=512, out_dim=256, pred_dim=128):
+        super().__init__()
+        self.projector = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim, bias=False),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, hidden_dim, bias=False),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, out_dim),
+            nn.BatchNorm1d(out_dim, affine=False)
+        )
+        self.predictor = nn.Sequential(
+            nn.Linear(out_dim, pred_dim, bias=False),
+            nn.BatchNorm1d(pred_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(pred_dim, out_dim)
+        )
+
+    def forward(self, x):
+        z = self.projector(x)
+        p = self.predictor(z)
+        return p, z
+
+
 class GANLoss(nn.Module):
     """Define different GAN objectives.
 
