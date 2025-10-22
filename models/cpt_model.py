@@ -42,9 +42,31 @@ class CPTModel(BaseModel):
         parser.add_argument('--asp_loss_mode', type=str, default='none', help='"scheduler_lookup" options for the ASP loss. Options for both are listed in Fig. 3 of the paper.')
         parser.add_argument('--n_downsampling', type=int, default=2, help='# of downsample in G')
         parser.add_argument('--lambda_siam', type=float, default=0.0, help='weight for the SimSiam loss')
-        parser.add_argument('--siam_hidden_dim', type=int, default=512, help='hidden dimension for SimSiam projector MLP')
-        parser.add_argument('--siam_out_dim', type=int, default=256, help='output dimension for SimSiam projector MLP')
-        parser.add_argument('--siam_pred_dim', type=int, default=128, help='hidden dimension for SimSiam predictor MLP')
+        parser.add_argument(
+            '--siam_backbone',
+            type=str,
+            default='resnet50',
+            choices=['resnet50', 'resnet18', 'custom'],
+            help='backbone preset that determines SimSiam projector dimensions'
+        )
+        parser.add_argument(
+            '--siam_hidden_dim',
+            type=int,
+            default=None,
+            help='hidden dimension for the SimSiam projector MLP (overrides preset when provided)'
+        )
+        parser.add_argument(
+            '--siam_out_dim',
+            type=int,
+            default=None,
+            help='output dimension for the SimSiam projector MLP (overrides preset when provided)'
+        )
+        parser.add_argument(
+            '--siam_pred_dim',
+            type=int,
+            default=None,
+            help='hidden dimension for the SimSiam predictor MLP (overrides preset when provided)'
+        )
 
         opt, _ = parser.parse_known_args()
 
@@ -89,6 +111,22 @@ class CPTModel(BaseModel):
         self.netG = networks.define_G(opt.input_nc, opt.output_nc, opt.ngf, opt.netG, opt.normG, not opt.no_dropout, opt.init_type, opt.init_gain, opt.no_antialias, opt.no_antialias_up, self.gpu_ids, opt)
         self.netF = networks.define_F(opt.input_nc, opt.netF, opt.normG, not opt.no_dropout, opt.init_type, opt.init_gain, opt.no_antialias, self.gpu_ids, opt)
 
+        if self.opt.lambda_siam > 0 and self.opt.siam_backbone != 'custom':
+            self.netS = networks.define_SimSiam(
+                hidden_dim=self.opt.siam_hidden_dim,
+                out_dim=self.opt.siam_out_dim,
+                pred_dim=self.opt.siam_pred_dim,
+                backbone=self.opt.siam_backbone,
+                init_type=self.opt.init_type,
+                init_gain=self.opt.init_gain,
+                gpu_ids=self.gpu_ids,
+            )
+            if 'S' not in self.model_names:
+                self.model_names.append('S')
+            if self.isTrain:
+                self.optimizer_S = torch.optim.Adam(self.netS.parameters(), lr=self.opt.lr, betas=(self.opt.beta1, self.opt.beta2))
+                self.optimizers.append(self.optimizer_S)
+
         if self.isTrain:
             self.netD = networks.define_D(opt.output_nc, opt.ndf, opt.netD, opt.n_layers_D, opt.normD, opt.init_type, opt.init_gain, opt.no_antialias, self.gpu_ids, opt)
 
@@ -110,7 +148,21 @@ class CPTModel(BaseModel):
                 else:
                     self.gp_weights = eval(self.opt.gp_weights)
                 self.loss_names += ['GP']
-@@ -117,55 +128,59 @@ class CPTModel(BaseModel):
+
+            if self.opt.lambda_asp > 0:
+                self.criterionASP = AdaptiveSupervisedPatchNCELoss(self.opt).to(self.device)
+                self.loss_names += ['ASP']
+
+
+    def data_dependent_initialize(self, data):
+        """
+        The feature network netF is defined in terms of the shape of the intermediate, extracted
+        features of the encoder portion of netG. Because of this, the weights of netF are
+        initialized at the first feedforward pass with some input images.
+        Please also see PatchSampleF.create_mlp(), which is called at the first forward() call.
+        """
+        bs_per_gpu = data["A"].size(0) // max(len(self.opt.gpu_ids), 1)
+        self.set_input(data)
         self.real_A = self.real_A[:bs_per_gpu]
         self.real_B = self.real_B[:bs_per_gpu]
         self.forward()                     # compute fake images: G(A)
@@ -170,7 +222,49 @@ class CPTModel(BaseModel):
             self.flipped_for_equivariance = self.opt.isTrain and (np.random.random() < 0.5)
             if self.flipped_for_equivariance:
                 self.real = torch.flip(self.real, [3])
-@@ -215,47 +230,81 @@ class CPTModel(BaseModel):
+
+        self.fake = self.netG(self.real, layers=[])
+        self.fake_B = self.fake[:self.real_A.size(0)]
+        if self.opt.nce_idt:
+            self.idt_B = self.fake[self.real_A.size(0):]
+
+    def compute_D_loss(self):
+        """Calculate GAN loss for the discriminator"""
+        fake = self.fake_B.detach()
+        # Fake; stop backprop to the generator by detaching fake_B
+        pred_fake = self.netD(fake)
+        self.loss_D_fake = self.criterionGAN(pred_fake, False).mean()
+        # Real
+        self.pred_real = self.netD(self.real_B)
+        loss_D_real = self.criterionGAN(self.pred_real, True)
+        self.loss_D_real = loss_D_real.mean()
+
+        # combine loss and calculate gradients
+        self.loss_D = (self.loss_D_fake + self.loss_D_real) * 0.5
+        return self.loss_D
+
+    def compute_G_loss(self):
+        """Calculate GAN and NCE loss for the generator"""
+        fake = self.fake_B
+
+        feat_real_A = self.netG(self.real_A, self.nce_layers, encode_only=True)
+        feat_fake_B = self.netG(self.fake_B, self.nce_layers, encode_only=True)
+        feat_real_B = self.netG(self.real_B, self.nce_layers, encode_only=True)
+        if self.opt.nce_idt:
+            feat_idt_B = self.netG(self.idt_B, self.nce_layers, encode_only=True)
+
+        # First, G(A) should fake the discriminator
+        if self.opt.lambda_GAN > 0.0:
+            pred_fake = self.netD(fake)
+            self.loss_G_GAN = self.criterionGAN(pred_fake, True).mean() * self.opt.lambda_GAN
+        else:
+            self.loss_G_GAN = 0.0
+
+        if self.opt.lambda_NCE > 0.0:
+            self.loss_NCE = self.calculate_NCE_loss(feat_real_A, feat_fake_B, self.netF, self.nce_layers)
+        else:
+            self.loss_NCE, self.loss_NCE_bd = 0.0, 0.0
+        loss_NCE_all = self.loss_NCE
 
         if self.opt.nce_idt and self.opt.lambda_NCE > 0.0:
             self.loss_NCE_Y = self.calculate_NCE_loss(feat_real_B, feat_idt_B, self.netF, self.nce_layers)
@@ -196,36 +290,61 @@ class CPTModel(BaseModel):
         else:
             self.loss_GP = 0
 
-        self.loss_G = self.loss_G_GAN + loss_NCE_all + self.loss_GP
         if self.opt.lambda_siam > 0:
-            siam_feat_fake = torch.flatten(F.adaptive_avg_pool2d(feat_fake_B[-1], (1, 1)), 1)
-            siam_feat_real = torch.flatten(F.adaptive_avg_pool2d(feat_real_B[-1], (1, 1)), 1)
-
-            if self.netS is None:
-                self.netS = networks.define_SimSiam(
-                    siam_feat_fake.shape[1],
-                    hidden_dim=self.opt.siam_hidden_dim,
-                    out_dim=self.opt.siam_out_dim,
-                    pred_dim=self.opt.siam_pred_dim,
-                    init_type=self.opt.init_type,
-                    init_gain=self.opt.init_gain,
-                    gpu_ids=self.gpu_ids,
-                )
-                if self.isTrain:
-                    self.optimizer_S = torch.optim.Adam(self.netS.parameters(), lr=self.opt.lr, betas=(self.opt.beta1, self.opt.beta2))
-                    self.optimizers.append(self.optimizer_S)
-                if 'S' not in self.model_names:
-                    self.model_names.append('S')
-
-            p_fake, z_fake = self.netS(siam_feat_fake)
-            p_real, z_real = self.netS(siam_feat_real)
-            siam_loss = 0.5 * (self.simsiam_loss(p_fake, z_real) + self.simsiam_loss(p_real, z_fake))
+            siam_loss = self._compute_siam_loss(feat_fake_B, feat_real_B)
             self.loss_Siam = siam_loss * self.opt.lambda_siam
         else:
             self.loss_Siam = 0.0
 
         self.loss_G = self.loss_G_GAN + loss_NCE_all + self.loss_GP + self.loss_Siam
         return self.loss_G
+
+    def _compute_siam_loss(self, feat_fake_B, feat_real_B):
+        cached_fake = None
+
+        if self.netS is None:
+            cached_fake = torch.flatten(F.adaptive_avg_pool2d(feat_fake_B[-1], (1, 1)), 1)
+            self._initialize_custom_simsiam(cached_fake)
+
+        siam_fake_input, siam_real_input = self._prepare_siam_inputs(
+            feat_fake_B,
+            feat_real_B,
+            cached_fake=cached_fake,
+        )
+
+        p_fake, z_fake = self.netS(siam_fake_input)
+        p_real, z_real = self.netS(siam_real_input)
+        return 0.5 * (self.simsiam_loss(p_fake, z_real) + self.simsiam_loss(p_real, z_fake))
+
+    def _initialize_custom_simsiam(self, sample_vector):
+        if self.opt.siam_backbone != 'custom':
+            return
+
+        input_dim = sample_vector.shape[1]
+        self.netS = networks.define_SimSiam(
+            input_dim=input_dim,
+            hidden_dim=self.opt.siam_hidden_dim,
+            out_dim=self.opt.siam_out_dim,
+            pred_dim=self.opt.siam_pred_dim,
+            backbone='custom',
+            init_type=self.opt.init_type,
+            init_gain=self.opt.init_gain,
+            gpu_ids=self.gpu_ids,
+        )
+        if 'S' not in self.model_names:
+            self.model_names.append('S')
+        if self.isTrain:
+            self.optimizer_S = torch.optim.Adam(self.netS.parameters(), lr=self.opt.lr, betas=(self.opt.beta1, self.opt.beta2))
+            self.optimizers.append(self.optimizer_S)
+
+    def _prepare_siam_inputs(self, feat_fake_B, feat_real_B, cached_fake=None):
+        if getattr(self.netS, 'expects_image_input', False):
+            return self.fake_B, self.real_B
+
+        if cached_fake is None:
+            cached_fake = torch.flatten(F.adaptive_avg_pool2d(feat_fake_B[-1], (1, 1)), 1)
+        cached_real = torch.flatten(F.adaptive_avg_pool2d(feat_real_B[-1], (1, 1)), 1)
+        return cached_fake, cached_real
 
     def calculate_NCE_loss(self, feat_src, feat_tgt, netF, nce_layers, paired=False):
         n_layers = len(feat_src)
