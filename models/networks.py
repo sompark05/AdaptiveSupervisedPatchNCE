@@ -361,49 +361,37 @@ class SimSiam(nn.Module):
     """SimSiam backbone + projector/predictor faithful to the reference implementation."""
 
     _BACKBONE_CONFIG = {
-        'resnet18': {'pred_dim': 128},
-        'resnet50': {'pred_dim': 512},
+        'resnet18': {'pred_dim': 128}
     }
 
     def __init__(
-            self,
-            input_dim=None,
-            hidden_dim=None,
-            out_dim=None,
-            pred_dim=None,
-            backbone='resnet50'):
+            self, input_dim=None, hidden_dim=None, out_dim=None, pred_dim=None, backbone='resnet18'):
         super().__init__()
-        self.backbone = (backbone or 'resnet50').lower()
-        self._custom_input = self.backbone == 'custom'
-
-        if self._custom_input:
-            if input_dim is None:
-                raise ValueError('input_dim must be provided when using a custom SimSiam head')
-            self.encoder = nn.Identity()
-            self._feature_dim = input_dim
-        else:
-            if self.backbone not in self._BACKBONE_CONFIG:
-                raise ValueError(f"Unsupported SimSiam backbone preset: {self.backbone}")
-            self.encoder, self._feature_dim = self._build_encoder(self.backbone)
-
+        self.backbone = (backbone or 'resnet18').lower()
+                
+        if self.backbone not in self._BACKBONE_CONFIG:
+            raise ValueError(f"Unsupported SimSiam backbone preset: {self.backbone}")
+           
         proj_hidden_dim, proj_out_dim, predictor_hidden_dim = self._resolve_dims(hidden_dim, out_dim, pred_dim)
 
-        self.projector = nn.Sequential(
-            nn.Linear(self._feature_dim, proj_hidden_dim, bias=False),
-            nn.BatchNorm1d(proj_hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(proj_hidden_dim, proj_hidden_dim, bias=False),
-            nn.BatchNorm1d(proj_hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(proj_hidden_dim, proj_out_dim, bias=False),
-            nn.BatchNorm1d(proj_out_dim, affine=False),
-        )
-        self.predictor = nn.Sequential(
-            nn.Linear(proj_out_dim, predictor_hidden_dim, bias=False),
-            nn.BatchNorm1d(predictor_hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(predictor_hidden_dim, proj_out_dim),
-        )
+        self.encoder = tv_models.resnet18(pretrained=False, zero_init_residual=True)
+        prev_dim = self.encoder.fc.weight.shape[1]
+        self.encoder.fc = nn.Linear(prev_dim,out_dim)
+        self.encoder.fc = nn.Sequential(nn.Linear(prev_dim, prev_dim, bias=False),
+                                        nn.BatchNorm1d(prev_dim),
+                                        nn.ReLU(inplace=True), # first layer
+                                        nn.Linear(prev_dim, prev_dim, bias=False),
+                                        nn.BatchNorm1d(prev_dim),
+                                        nn.ReLU(inplace=True), # second layer
+                                        self.encoder.fc,
+                                        nn.BatchNorm1d(out_dim, affine=False)) # output layer  ********
+        self.encoder.fc[6].bias.requires_grad = False # hack: not use bias as it is followed by BN
+
+        # build a 2-layer predictor
+        self.predictor = nn.Sequential(nn.Linear(out_dim, hidden_dim, bias=False),
+                                        nn.BatchNorm1d(hidden_dim),
+                                        nn.ReLU(inplace=True), # hidden layer
+                                        nn.Linear(hidden_dim, out_dim)) # output layer
 
     @property
     def expects_image_input(self):
@@ -412,30 +400,6 @@ class SimSiam(nn.Module):
     @property
     def feature_dim(self):
         return self._feature_dim
-
-    def _build_encoder(self, backbone):
-        constructor = getattr(tv_models, backbone, None)
-        if constructor is None:
-            raise ValueError(f"Unsupported SimSiam backbone preset: {backbone}")
-
-        kwargs = {}
-        signature = inspect.signature(constructor)
-        if 'weights' in signature.parameters:
-            kwargs['weights'] = None
-        elif 'pretrained' in signature.parameters:
-            kwargs['pretrained'] = False
-        if 'zero_init_residual' in signature.parameters:
-            kwargs.setdefault('zero_init_residual', True)
-
-        encoder = constructor(**kwargs)
-        if not hasattr(encoder, 'fc'):
-            raise ValueError(f"Backbone {backbone} does not expose a fully connected layer for SimSiam")
-        if hasattr(encoder.fc, 'in_features'):
-            feature_dim = encoder.fc.in_features
-        else:
-            feature_dim = encoder.fc.weight.shape[1]
-        encoder.fc = nn.Identity()
-        return encoder, feature_dim
 
     def _resolve_dims(self, hidden_dim, out_dim, pred_dim):
         if hidden_dim is None and out_dim is None:
@@ -457,14 +421,19 @@ class SimSiam(nn.Module):
 
         return proj_hidden_dim, proj_out_dim, pred_dim
 
-    def forward(self, x):
-        features = self.encoder(x)
-        if features.dim() > 2:
-            features = torch.flatten(features, 1)
-        z = self.projector(features)
-        p = self.predictor(z)
-        return p, z
+    def forward(self, x1, x2):
+        """
+        Input:
+            x1: first views of images
+            x2: second views of images
+        """
 
+        z1 = self.encoder(x1)
+        z2 = self.encoder(x2)
+
+        p1 = self.predictor(z1)
+        p2 = self.predictor(z2)
+        return (z1, z2), (p1, p2)
 
 class GANLoss(nn.Module):
     """Define different GAN objectives.
