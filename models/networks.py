@@ -1,4 +1,5 @@
 from copy import copy
+import inspect
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -6,6 +7,7 @@ from torch.nn import init
 import functools
 from torch.optim import lr_scheduler
 import numpy as np
+import torchvision.models as tv_models
 
 ###############################################################################
 # Helper Functions
@@ -280,6 +282,33 @@ def define_F(input_nc, netF, norm='batch', use_dropout=False, init_type='normal'
     return init_net(net, init_type, init_gain, gpu_ids)
 
 
+def define_SimSiam(
+        input_dim=None,
+        hidden_dim=None,
+        out_dim=None,
+        pred_dim=None,
+        backbone='resnet50',
+        init_type='normal',
+        init_gain=0.02,
+        gpu_ids=None):
+    if gpu_ids is None:
+        gpu_ids = []
+    net = SimSiam(
+        input_dim=input_dim,
+        hidden_dim=hidden_dim,
+        out_dim=out_dim,
+        pred_dim=pred_dim,
+        backbone=backbone,
+    )
+    if backbone == 'custom':
+        net = init_net(net, init_type, init_gain, gpu_ids)
+    else:
+        net = init_net(net, init_type, init_gain, gpu_ids, initialize_weights=False)
+    init_weights(net.projector, init_type, init_gain)
+    init_weights(net.predictor, init_type, init_gain)
+    return net
+
+
 def define_D(input_nc, ndf, netD, n_layers_D=3, norm='batch', init_type='normal', init_gain=0.02, no_antialias=False, gpu_ids=[], opt=None):
     """Create a discriminator
 
@@ -328,6 +357,115 @@ def define_D(input_nc, ndf, netD, n_layers_D=3, norm='batch', init_type='normal'
 ##############################################################################
 # Classes
 ##############################################################################
+class SimSiam(nn.Module):
+    """SimSiam backbone + projector/predictor faithful to the reference implementation."""
+
+    _BACKBONE_CONFIG = {
+        'resnet18': {'pred_dim': 128},
+        'resnet50': {'pred_dim': 512},
+    }
+
+    def __init__(
+            self,
+            input_dim=None,
+            hidden_dim=None,
+            out_dim=None,
+            pred_dim=None,
+            backbone='resnet50'):
+        super().__init__()
+        self.backbone = (backbone or 'resnet50').lower()
+        self._custom_input = self.backbone == 'custom'
+
+        if self._custom_input:
+            if input_dim is None:
+                raise ValueError('input_dim must be provided when using a custom SimSiam head')
+            self.encoder = nn.Identity()
+            self._feature_dim = input_dim
+        else:
+            if self.backbone not in self._BACKBONE_CONFIG:
+                raise ValueError(f"Unsupported SimSiam backbone preset: {self.backbone}")
+            self.encoder, self._feature_dim = self._build_encoder(self.backbone)
+
+        proj_hidden_dim, proj_out_dim, predictor_hidden_dim = self._resolve_dims(hidden_dim, out_dim, pred_dim)
+
+        self.projector = nn.Sequential(
+            nn.Linear(self._feature_dim, proj_hidden_dim, bias=False),
+            nn.BatchNorm1d(proj_hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(proj_hidden_dim, proj_hidden_dim, bias=False),
+            nn.BatchNorm1d(proj_hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(proj_hidden_dim, proj_out_dim, bias=False),
+            nn.BatchNorm1d(proj_out_dim, affine=False),
+        )
+        self.predictor = nn.Sequential(
+            nn.Linear(proj_out_dim, predictor_hidden_dim, bias=False),
+            nn.BatchNorm1d(predictor_hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(predictor_hidden_dim, proj_out_dim),
+        )
+
+    @property
+    def expects_image_input(self):
+        return not self._custom_input
+
+    @property
+    def feature_dim(self):
+        return self._feature_dim
+
+    def _build_encoder(self, backbone):
+        constructor = getattr(tv_models, backbone, None)
+        if constructor is None:
+            raise ValueError(f"Unsupported SimSiam backbone preset: {backbone}")
+
+        kwargs = {}
+        signature = inspect.signature(constructor)
+        if 'weights' in signature.parameters:
+            kwargs['weights'] = None
+        elif 'pretrained' in signature.parameters:
+            kwargs['pretrained'] = False
+        if 'zero_init_residual' in signature.parameters:
+            kwargs.setdefault('zero_init_residual', True)
+
+        encoder = constructor(**kwargs)
+        if not hasattr(encoder, 'fc'):
+            raise ValueError(f"Backbone {backbone} does not expose a fully connected layer for SimSiam")
+        if hasattr(encoder.fc, 'in_features'):
+            feature_dim = encoder.fc.in_features
+        else:
+            feature_dim = encoder.fc.weight.shape[1]
+        encoder.fc = nn.Identity()
+        return encoder, feature_dim
+
+    def _resolve_dims(self, hidden_dim, out_dim, pred_dim):
+        if hidden_dim is None and out_dim is None:
+            default_out_dim = self._feature_dim
+        else:
+            default_out_dim = out_dim if out_dim is not None else hidden_dim
+
+        proj_out_dim = default_out_dim if default_out_dim is not None else self._feature_dim
+        proj_hidden_dim = hidden_dim if hidden_dim is not None else proj_out_dim
+
+        if pred_dim is None:
+            if self._custom_input:
+                pred_dim = max(proj_out_dim // 4, 1)
+            else:
+                pred_dim = self._BACKBONE_CONFIG[self.backbone]['pred_dim']
+
+        if proj_hidden_dim <= 0 or proj_out_dim <= 0 or pred_dim <= 0:
+            raise ValueError('SimSiam dimensions must be positive integers')
+
+        return proj_hidden_dim, proj_out_dim, pred_dim
+
+    def forward(self, x):
+        features = self.encoder(x)
+        if features.dim() > 2:
+            features = torch.flatten(features, 1)
+        z = self.projector(features)
+        p = self.predictor(z)
+        return p, z
+
+
 class GANLoss(nn.Module):
     """Define different GAN objectives.
 
